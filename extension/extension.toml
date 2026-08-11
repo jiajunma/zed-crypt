@@ -1,5 +1,8 @@
-id = "zed-crypt"
-name = "zed-crypt"
+# "zed" is not allowed in registry extension IDs/names, so the extension is
+# published as "encrypted-armor" (matching the language it provides) even
+# though the repo is named zed-crypt.
+id = "encrypted-armor"
+name = "Encrypted Armor"
 version = "0.1.0"
 schema_version = 1
 authors = ["Jiajun Ma <hoxide@gmail.com>"]
