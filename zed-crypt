@@ -27,8 +27,10 @@
 #         with sops metadata  blocking editor; sops manages its own tmpfile.
 #
 # USAGE
-#   zed-crypt edit  FILE     decrypt, open, re-encrypt on save, seal on close
-#   zed-crypt close FILE     manual seal (normally automatic)
+#   zed-crypt edit    FILE   decrypt, open, re-encrypt on save, seal on close
+#   zed-crypt convert FILE   binary gpg -> armored gpg, in place (same name,
+#                            same recipients); afterwards Zed opens it directly
+#   zed-crypt close   FILE   manual seal (normally automatic)
 #   zed-crypt status         list open sessions
 #   zed-crypt backends       show which backends are usable on this machine
 
@@ -323,6 +325,57 @@ cmd_close() {
   printf 'sealed %s, plaintext removed\n' "$enc"
 }
 
+# One-time migration: binary gpg -> ASCII-armored gpg, in place. Same
+# encryption, same keys — armor is just OpenPGP's text encoding — but Zed
+# refuses binary files outright, so armored is what makes transparent
+# extension-mode editing possible. Keeps a .bak-binary and restores it on
+# any failure.
+cmd_convert() {
+  local enc=${1:-}
+  [[ -n $enc ]] || die "usage: zed-crypt convert FILE.gpg"
+  [[ -f $enc ]] || die "no such file: $enc"
+  enc=$(abs_path "$enc")
+  command -v gpg >/dev/null || die "gpg not installed"
+
+  if head -c 64 "$enc" | grep -q 'BEGIN PGP'; then
+    printf 'already armored, nothing to do: %s\n' "$enc"
+    return 0
+  fi
+
+  local keys
+  keys=$(gpg --batch --list-packets "$enc" 2>/dev/null \
+    | awk '/^:pubkey enc packet/ { for (i=1;i<=NF;i++) if ($i=="keyid") print $(i+1) }' \
+    | sort -u)
+  [[ -n $keys ]] || die "no public-key recipients (symmetric or non-gpg file; cannot convert)"
+
+  local bak="$enc.bak-binary"
+  [[ -e $bak ]] && die "backup already exists: $bak — move it aside first"
+  cp -p "$enc" "$bak" || die "cannot create backup"
+
+  local -a args=(--batch --yes --armor --output "$enc")
+  local k
+  while read -r k; do [[ -n $k ]] && args+=(--recipient "$k"); done <<< "$keys"
+  args+=(--encrypt)
+
+  # pipefail is set: a cancelled passphrase entry fails the whole pipe.
+  if ! gpg --decrypt "$bak" 2>/dev/null | gpg "${args[@]}"; then
+    mv "$bak" "$enc"
+    die "conversion failed (passphrase cancelled?); original restored"
+  fi
+
+  local a b
+  a=$(gpg --batch --quiet -d "$bak" 2>/dev/null | wc -c | tr -d ' ')
+  b=$(gpg --batch --quiet -d "$enc" 2>/dev/null | wc -c | tr -d ' ')
+  if [[ -z $a || $a == 0 || $a != "$b" ]]; then
+    mv "$bak" "$enc"
+    die "verification failed (decrypted sizes differ); original restored"
+  fi
+
+  printf 'converted to armored gpg (same recipients, same name): %s\n' "$enc"
+  printf 'verified: decrypts to %s bytes, identical to the original\n' "$b"
+  printf 'binary backup kept at %s — delete it once satisfied\n' "$bak"
+}
+
 cmd_status() {
   init_scratch
   local found=0 pidf plain
@@ -346,8 +399,9 @@ cmd_backends() {
 
 case "${1:-}" in
   edit)     shift; cmd_edit "$@" ;;
+  convert)  shift; cmd_convert "$@" ;;
   close)    shift; cmd_close "$@" ;;
   status)   cmd_status ;;
   backends) cmd_backends ;;
-  *) die "usage: zed-crypt {edit|close|status|backends} [FILE]" ;;
+  *) die "usage: zed-crypt {edit|convert|close|status|backends} [FILE]" ;;
 esac

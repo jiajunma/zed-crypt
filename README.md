@@ -13,14 +13,18 @@ Edit encrypted files from [Zed](https://zed.dev) with **gpg**, **age**, and
 Successor to [zed-gpg](https://github.com/jiajunma/zed-gpg).
 
 ```bash
-# Watcher mode
+# Extension mode: no commands — just open an armored .asc/.age/.gpg in Zed.
+
+# Have existing BINARY .gpg files? Convert once (same keys, same name,
+# still gpg — armor is OpenPGP's text encoding), then Zed opens them directly:
+zed-crypt convert ~/passwords.txt.gpg  # backs up, re-encrypts armored, verifies
+
+# Watcher mode (any format, incl. binary you don't want to convert)
 zed-crypt edit ~/notes/diary.tex.gpg   # decrypt, open in Zed; every save
                                        # re-encrypts; closing the tab seals
 zed-crypt status                       # what's open right now
 zed-crypt backends                     # which backends this machine can use
 zed-crypt close FILE                   # manual seal (normally not needed)
-
-# Extension mode: no commands — just open the .asc/.age file in Zed.
 ```
 
 ## Extension mode
@@ -181,6 +185,36 @@ overwrite-on-delete in the `$TMPDIR` fallback path.
 - A reboot or RAM-disk detach while a file is open loses **unsaved** edits
   (saved edits were already re-encrypted within a second of saving).
 - gpg symmetric files are unsupported.
+
+## FAQ / Troubleshooting
+
+**"Could not open file — Binary files are not supported."**
+Zed core refuses binary content before any extension runs. Run
+`zed-crypt convert file.gpg` once (recommended), or edit via
+`zed-crypt edit file.gpg` without changing the file.
+
+**Is an armored file still "real gpg"?**
+Yes. `--armor` changes only how the ciphertext bytes are written (base64 text
+vs raw). Same algorithms, same keys, same security; `gpg -d`, vim-gnupg and
+Emacs epa all read both encodings interchangeably.
+
+**No password prompt appears / decryption silently fails.**
+The prompt is gpg-agent's *pinentry*, not the editor's. A GUI-launched editor
+has no terminal, so a curses pinentry cannot appear — install a GUI one (see
+setup above). Multi-monitor users: the dialog can open on the other screen.
+Tick "save in keychain" and it never asks again. (Editors cannot prompt
+natively: since GnuPG 2.1 the passphrase never leaves gpg-agent by design,
+and LSP has no input-box request anyway.)
+
+**The tab always shows an unsaved-changes dot.**
+By design: the plaintext swap is an in-memory edit that is never written (only
+its encrypted form is). Both "Save" and "Don't save" on close are safe. Keep
+`session.restore_unsaved_buffers` off so the dirty plaintext is never
+persisted by Zed, and don't enable autosave for this language.
+
+**Another editor shows armor/garbage instead of plaintext.**
+That editor's gpg plugin isn't active (e.g. a stale vim setup on `$PATH`).
+The file is fine — `gpg -d file` will prove it.
 
 ## License
 
