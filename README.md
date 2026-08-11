@@ -82,7 +82,16 @@ local database on quit.
 ### Extension-mode trade-offs
 
 - **Armored files only** (`gpg --armor` / `age --armor`); binary ciphertext
-  cannot round-trip through a UTF-8 text buffer.
+  cannot round-trip through a UTF-8 text buffer. Opening a binary `.gpg`
+  shows an error pointing at `zed-crypt edit`, and the formatter refuses to
+  save such buffers (which would otherwise corrupt the ciphertext). Convert
+  once with `gpg -d f.gpg | gpg --armor -r <you> -e -o f.asc` for transparent
+  editing.
+- **A passphrase-protected key needs a GUI pinentry** — the LSP has no
+  terminal, so a curses pinentry cannot appear. On macOS:
+  `brew install pinentry-mac`, then put
+  `pinentry-program /opt/homebrew/bin/pinentry-mac` in
+  `~/.gnupg/gpg-agent.conf` and run `gpgconf --kill gpg-agent`.
 - The buffer is always dirty, so closing the tab prompts to save. "Save" is
   safe (encrypts); "Don't save" is also safe (disk already has ciphertext).
 - Don't enable autosave for this language — each save produces fresh

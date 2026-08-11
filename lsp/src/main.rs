@@ -32,6 +32,16 @@ fn is_armor(text: &str) -> bool {
     t.starts_with(PGP_HEADER) || t.starts_with(AGE_HEADER)
 }
 
+/// Binary OpenPGP data: first byte has the high bit set (packet tag).
+/// Zed's UTF-8 buffer cannot round-trip it, so we refuse instead of mangling.
+fn is_binary_pgp(head: &[u8]) -> bool {
+    head.first().is_some_and(|b| b & 0x80 != 0)
+}
+
+const BINARY_GPG_HINT: &str = "binary gpg file — Zed's text buffer cannot hold it. \
+Use `zed-crypt edit <file>` (RAM-disk watcher), or convert once to armored: \
+gpg -d file.gpg | gpg --armor -r <you> -e -o file.asc";
+
 fn fail(msg: &str) -> ! {
     eprintln!("zed-crypt-lsp: {msg}");
     std::process::exit(1);
@@ -160,6 +170,10 @@ fn encrypt_for_target(plain: &[u8], target: &str) -> Result<Vec<u8>, String> {
     } else if head_str.trim_start().starts_with(AGE_HEADER) {
         let rcpt = age_recipients_file(target)?;
         run("age", &["--encrypt", "--armor", "-R", &rcpt], Some(plain))
+    } else if is_binary_pgp(&head) {
+        // Refusing also protects the file: without this, saving the lossy
+        // UTF-8 rendering of binary ciphertext would corrupt it.
+        Err(BINARY_GPG_HINT.into())
     } else {
         Err(format!("{target} is not an armored gpg/age file"))
     }
@@ -317,6 +331,13 @@ impl Server {
                             self.swap_buffer(&uri, &plain);
                         }
                         Err(e) => self.show_error(&format!("decrypt failed: {e}")),
+                    }
+                } else {
+                    // Buffer isn't armor. If the file on disk is binary gpg,
+                    // tell the user what to do instead of failing silently.
+                    let on_disk = std::fs::read(uri_to_path(&uri)).unwrap_or_default();
+                    if is_binary_pgp(&on_disk[..on_disk.len().min(4)]) {
+                        self.show_error(BINARY_GPG_HINT);
                     }
                 }
             }

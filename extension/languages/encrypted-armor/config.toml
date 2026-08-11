@@ -1,3 +1,5 @@
 name = "Encrypted Armor"
-path_suffixes = ["asc", "age"]
+# gpg/pgp are included so binary ciphertext gets a helpful error (and the
+# formatter blocks saves that would corrupt it) instead of failing silently.
+path_suffixes = ["asc", "age", "gpg", "pgp"]
 line_comments = []
