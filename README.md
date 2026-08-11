@@ -81,12 +81,14 @@ local database on quit.
 
 ### Extension-mode trade-offs
 
-- **Armored files only** (`gpg --armor` / `age --armor`); binary ciphertext
-  cannot round-trip through a UTF-8 text buffer. Opening a binary `.gpg`
-  shows an error pointing at `zed-crypt edit`, and the formatter refuses to
-  save such buffers (which would otherwise corrupt the ciphertext). Convert
-  once with `gpg -d f.gpg | gpg --armor -r <you> -e -o f.asc` for transparent
-  editing.
+- **Armored files only** (`gpg --armor` / `age --armor`). Zed refuses binary
+  files outright ("Binary files are not supported") before any extension code
+  runs, so binary `.gpg` cannot be opened in Zed at all — use
+  `zed-crypt edit f.gpg` from a terminal, or convert once with
+  `gpg -d f.gpg | gpg --armor -r <you> -e -o f.asc`. (Armored files that
+  happen to be named `.gpg` do work — the suffix is registered.) As a
+  safety net, the formatter refuses to encrypt a buffer whose on-disk target
+  is binary, so an odd edge case can never corrupt ciphertext.
 - **A passphrase-protected key needs a GUI pinentry** — the LSP has no
   terminal, so a curses pinentry cannot appear. On macOS:
   `brew install pinentry-mac`, then put
