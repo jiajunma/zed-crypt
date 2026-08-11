@@ -1,0 +1,3 @@
+name = "Encrypted Armor"
+path_suffixes = ["asc", "age"]
+line_comments = []

@@ -1,31 +1,96 @@
 # zed-crypt
 
-Edit encrypted files from [Zed](https://zed.dev) — or any editor with a
-blocking CLI — with **gpg**, **age**, and **sops** backends.
+Edit encrypted files from [Zed](https://zed.dev) with **gpg**, **age**, and
+**sops** backends — two complementary modes:
 
-Successor to [zed-gpg](https://github.com/jiajunma/zed-gpg), fixing its two
-real flaws: the plaintext no longer touches persistent storage (RAM-disk
-scratch), and sealing is automatic (`zed --wait` detects the buffer closing).
+1. **Extension mode** (`extension/` + `lsp/`): open an armored `.asc`/`.age`
+   file in Zed and it just decrypts; saving re-encrypts. Plaintext exists
+   **only in memory** — vim-gnupg-grade. Armored files only.
+2. **Watcher mode** (`zed-crypt` script): works with *any* file format
+   (including binary `.gpg`) and any editor with a blocking CLI. Plaintext
+   lives on a RAM disk, never on persistent storage.
+
+Successor to [zed-gpg](https://github.com/jiajunma/zed-gpg).
 
 ```bash
+# Watcher mode
 zed-crypt edit ~/notes/diary.tex.gpg   # decrypt, open in Zed; every save
                                        # re-encrypts; closing the tab seals
 zed-crypt status                       # what's open right now
 zed-crypt backends                     # which backends this machine can use
 zed-crypt close FILE                   # manual seal (normally not needed)
+
+# Extension mode: no commands — just open the .asc/.age file in Zed.
 ```
 
-## Why not a Zed extension?
+## Extension mode
 
-Zed's extension API (`zed_extension_api`) exposes language servers, slash
-commands, MCP servers, debug adapters and docs indexing — **no file I/O hooks,
-no virtual filesystem**. Zed reads raw bytes into the buffer before any
-extension code could run, so "decrypt on open" cannot be implemented inside
-the editor. (An LSP `workspace/applyEdit` trick can fake the open half, but on
-save the plaintext would be written to the *original* file path before
-re-encryption — strictly worse than doing this outside the editor.)
+Zed's extension API has no file I/O hooks, but two mechanisms compose into
+exactly the pair vim-gnupg gets from `BufReadPost`/`BufWritePre`:
 
-So the logic lives outside, where it also happens to work with any editor.
+- **Read side**: the extension registers an "Encrypted Armor" language for
+  `.asc`/`.age` and starts `zed-crypt-lsp`. On `didOpen` the server decrypts
+  the file from disk and swaps the buffer to plaintext via
+  `workspace/applyEdit`.
+- **Write side**: the language's *external formatter* is
+  `zed-crypt-lsp --format {buffer_path}` — on save Zed pipes the plaintext
+  buffer through it and writes only the returned ciphertext. After the save,
+  `didSave` triggers another `applyEdit` swapping the buffer back to
+  plaintext.
+
+**Failure-safety** (verified in Zed's source, `crates/editor/src/items.rs`):
+`Editor::save` awaits the format task with `?` *before* `save_buffers`, and an
+external formatter's non-zero exit is a hard error — so if encryption fails,
+**the save is aborted and plaintext never reaches disk**. The formatter also
+passes armored input through unchanged, so undoing past the decrypt and
+saving cannot double-encrypt.
+
+### Extension setup
+
+```bash
+cd lsp && cargo build --release
+install -m 755 target/release/zed-crypt-lsp ~/.local/bin/
+```
+
+Then in Zed: `zed: install dev extension` → pick the `extension/` directory,
+and add to `settings.json`:
+
+```json
+{
+  "languages": {
+    "Encrypted Armor": {
+      "formatter": {
+        "external": {
+          "command": "/absolute/path/to/.local/bin/zed-crypt-lsp",
+          "arguments": ["--format", "{buffer_path}"]
+        }
+      },
+      "format_on_save": "on",
+      "remove_trailing_whitespace_on_save": false,
+      "ensure_final_newline_on_save": false
+    }
+  },
+  "session": { "restore_unsaved_buffers": false }
+}
+```
+
+`restore_unsaved_buffers: false` matters: the decrypted buffer is permanently
+dirty (the plaintext swap is an unsaved edit by design), and without this
+setting Zed would persist dirty buffers — i.e. your **plaintext** — into its
+local database on quit.
+
+### Extension-mode trade-offs
+
+- **Armored files only** (`gpg --armor` / `age --armor`); binary ciphertext
+  cannot round-trip through a UTF-8 text buffer.
+- The buffer is always dirty, so closing the tab prompts to save. "Save" is
+  safe (encrypts); "Don't save" is also safe (disk already has ciphertext).
+- Don't enable autosave for this language — each save produces fresh
+  ciphertext and re-dirties the buffer, which loops.
+- New files must be created with `gpg`/`age` once before editing (the
+  formatter reads recipients from the existing ciphertext on disk).
+- No syntax highlighting for the inner content (the language is "Encrypted
+  Armor", not LaTeX/Markdown).
 
 ## How it works
 
@@ -79,6 +144,12 @@ overwrite-on-delete in the `$TMPDIR` fallback path.
 | `AGE_IDENTITY` | unset | Path to an age identity file |
 
 ## Security model, honestly
+
+| | Plaintext location | Failure mode on encrypt error |
+|---|---|---|
+| Extension mode | Editor buffer + LSP process + pipes only | Save aborted; nothing written |
+| Watcher mode | File on RAM disk (never SSD) | Plaintext kept on RAM disk, user notified |
+| vim-gnupg / Emacs epa | Editor memory + pipes | Write aborted |
 
 - Plaintext exists **in RAM** while a file is open (RAM disk + editor buffer).
   Anything running as your user can read it during that window. This equals

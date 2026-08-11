@@ -1,0 +1,11 @@
+id = "zed-crypt"
+name = "zed-crypt"
+version = "0.1.0"
+schema_version = 1
+authors = ["Jiajun Ma <hoxide@gmail.com>"]
+description = "Transparent editing of armored gpg/age encrypted files (.asc/.age)"
+repository = "https://github.com/jiajunma/zed-crypt"
+
+[language_servers.zed-crypt-lsp]
+name = "zed-crypt LSP"
+languages = ["Encrypted Armor"]

@@ -2,3 +2,6 @@
 *.asc
 *.pgp
 *.age
+target/
+extension.wasm
+grammars/
