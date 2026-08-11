@@ -1,0 +1,353 @@
+#!/bin/bash
+# zed-crypt — edit encrypted files in Zed (or any blocking editor), with
+# pluggable encryption backends: gpg, age, sops.
+#
+# DESIGN
+#   Zed's extension API has no file I/O hooks, so transparent in-editor
+#   decryption is impossible. Instead: decrypt to a scratch file on a RAM disk,
+#   open it, re-encrypt on every save, and seal automatically when the buffer
+#   closes (`zed --wait` blocks until then).
+#
+#   Scratch lives on a RAM disk (macOS: hdiutil ram://, Linux: /dev/shm), so
+#   the plaintext never touches persistent storage. macOS swap is encrypted by
+#   default, so paged-out RAM-disk blocks are covered too. If no RAM disk can
+#   be created, falls back to $TMPDIR with a warning.
+#
+# BACKENDS
+#   gpg   *.gpg *.pgp *.asc   recipients recovered from the ciphertext itself;
+#                             armor detected from the file header; symmetric
+#                             files are refused (can't re-encrypt faithfully)
+#   age   *.age               recipients are NOT recoverable from an age file;
+#                             they come from .age-recipients next to the file,
+#                             or ~/.config/age/recipients.txt, or $AGE_RECIPIENTS
+#                             (a recipients-file path). Identities for decrypt:
+#                             $AGE_IDENTITY, ~/.config/age/keys.txt, or
+#                             ~/.config/sops/age/keys.txt.
+#   sops  yaml/json/env/ini   delegated to `sops edit` with EDITOR set to the
+#         with sops metadata  blocking editor; sops manages its own tmpfile.
+#
+# USAGE
+#   zed-crypt edit  FILE     decrypt, open, re-encrypt on save, seal on close
+#   zed-crypt close FILE     manual seal (normally automatic)
+#   zed-crypt status         list open sessions
+#   zed-crypt backends       show which backends are usable on this machine
+
+set -uo pipefail
+
+POLL_SECONDS=1
+EDITOR_CMD=${ZED_CRYPT_EDITOR:-"zed --wait"}
+RAMDISK_VOL="/Volumes/zed-crypt"
+RAMDISK_MB=${ZED_CRYPT_RAMDISK_MB:-64}
+SHRED=$(command -v gshred || command -v shred || true)
+
+die()  { printf 'zed-crypt: %s\n' "$*" >&2; exit 1; }
+note() { printf 'zed-crypt: %s\n' "$*" >&2; }
+
+abs_path() {
+  ( cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "$1")" )
+}
+
+# ---------------------------------------------------------------- scratch ----
+
+ensure_ramdisk() {
+  [[ -d $RAMDISK_VOL ]] && return 0
+  local dev
+  dev=$(hdiutil attach -nomount "ram://$((RAMDISK_MB * 2048))" 2>/dev/null | tr -d '[:space:]') || return 1
+  # HFS+ over APFS: no copy-on-write, so overwrite-on-delete actually works.
+  diskutil erasevolume HFS+ zed-crypt "$dev" >/dev/null 2>&1 && return 0
+  hdiutil detach "$dev" >/dev/null 2>&1
+  return 1
+}
+
+scratch_root() {
+  if [[ -z ${ZED_CRYPT_NO_RAMDISK:-} ]]; then
+    case $(uname) in
+      Darwin)
+        if ensure_ramdisk; then printf '%s' "$RAMDISK_VOL"; return; fi
+        note "RAM disk unavailable; falling back to \$TMPDIR (plaintext will touch disk)"
+        ;;
+      Linux)
+        if [[ -d /dev/shm && -w /dev/shm ]]; then printf '/dev/shm'; return; fi
+        ;;
+    esac
+  fi
+  printf '%s' "${TMPDIR:-/tmp}"
+}
+
+init_scratch() {
+  SCRATCH="$(scratch_root)/zed-crypt-$(id -u)"
+  mkdir -p "$SCRATCH" || die "cannot create $SCRATCH"
+  chmod 700 "$SCRATCH"
+  # Off the RAM disk: the session holds this open, and an open file on the
+  # volume would block the detach. Holds filenames only, never content.
+  LOG="${TMPDIR:-/tmp}/zed-crypt-$(id -u).log"
+}
+
+# Detach the RAM disk once nothing is open, so plaintext-capable memory is
+# handed back rather than lingering.
+maybe_detach_ramdisk() {
+  [[ -d $RAMDISK_VOL ]] || return 0
+  local d="$RAMDISK_VOL/zed-crypt-$(id -u)"
+  compgen -G "$d/*.session.pid" >/dev/null 2>&1 && return 0
+  hdiutil detach "$RAMDISK_VOL" >/dev/null 2>&1 || true
+}
+
+# Map an encrypted path to its scratch plaintext path. Hash prefix keeps two
+# files with the same basename apart; stripping the crypto extension lets the
+# editor pick the right language for the inner file (diary.tex.gpg → .tex).
+scratch_path_for() {
+  local base tag
+  base=$(basename "$1")
+  base=${base%.gpg}; base=${base%.pgp}; base=${base%.asc}; base=${base%.age}
+  tag=$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)
+  printf '%s/%s.%s' "$SCRATCH" "$tag" "$base"
+}
+
+scrub() {
+  local f
+  for f in "$@"; do
+    [[ -f $f ]] || continue
+    if [[ -n $SHRED ]]; then "$SHRED" -u "$f" 2>/dev/null || rm -f "$f"; else rm -f "$f"; fi
+  done
+}
+
+# ------------------------------------------------------------ backend: gpg ---
+
+gpg_available() { command -v gpg >/dev/null; }
+
+gpg_match() { case $1 in *.gpg|*.pgp|*.asc) return 0;; *) return 1;; esac; }
+
+# meta file: recipient key ids, one per line. flags file: "armor" if armored.
+gpg_precheck() {
+  local enc=$1 meta=$2 flags=$3
+  gpg --batch --list-packets "$enc" 2>/dev/null \
+    | awk '/^:pubkey enc packet/ { for (i=1;i<=NF;i++) if ($i=="keyid") print $(i+1) }' \
+    | sort -u > "$meta"
+  [[ -s $meta ]] || die "$enc has no public-key recipients (symmetric gpg files are not supported: they cannot be re-encrypted faithfully)"
+  : > "$flags"
+  head -c 64 "$enc" | grep -q 'BEGIN PGP' && echo armor >> "$flags"
+  return 0
+}
+
+# Backends emit plaintext/ciphertext on stdout; the caller owns the output
+# file (created with restrictive permissions before any bytes land in it).
+gpg_decrypt() { gpg --batch --quiet --decrypt -- "$1" 2>/dev/null; }
+
+gpg_encrypt() {
+  local plain=$1 meta=$2 flags=$3 key
+  local -a args=(--batch --quiet --output -)
+  grep -q '^armor$' "$flags" 2>/dev/null && args+=(--armor)
+  while read -r key; do [[ -n $key ]] && args+=(--recipient "$key"); done < "$meta"
+  args+=(--encrypt)
+  gpg "${args[@]}" -- "$plain" 2>/dev/null
+}
+
+# ------------------------------------------------------------ backend: age ---
+
+age_available() { command -v age >/dev/null; }
+
+age_match() { [[ $1 == *.age ]]; }
+
+age_identity_file() {
+  local c
+  for c in "${AGE_IDENTITY:-}" "$HOME/.config/age/keys.txt" "$HOME/.config/sops/age/keys.txt"; do
+    [[ -n $c && -f $c ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# meta file: a copy of the recipients file (age -R format).
+age_precheck() {
+  local enc=$1 meta=$2 flags=$3 c
+  : > "$flags"
+  age_identity_file >/dev/null || die "no age identity found (set \$AGE_IDENTITY or create ~/.config/age/keys.txt)"
+  for c in "${AGE_RECIPIENTS:-}" "$(dirname "$enc")/.age-recipients" "$HOME/.config/age/recipients.txt"; do
+    [[ -n $c && -s $c ]] && { cp "$c" "$meta"; return 0; }
+  done
+  die "no recipients for re-encryption: age files do not record their recipients, so put them in .age-recipients next to $enc (or ~/.config/age/recipients.txt, or point \$AGE_RECIPIENTS at a file)"
+}
+
+age_decrypt() { age --decrypt -i "$(age_identity_file)" -- "$1" 2>/dev/null; }
+
+age_encrypt() { age --encrypt -R "$2" -- "$1" 2>/dev/null; }
+
+# ----------------------------------------------------------- backend: sops ---
+
+sops_available() { command -v sops >/dev/null; }
+
+sops_match() {
+  case $1 in *.yaml|*.yml|*.json|*.env|*.ini) ;; *) return 1;; esac
+  grep -qE '(^sops:|"sops":|ENC\[)' "$1" 2>/dev/null
+}
+
+# ------------------------------------------------------------- dispatching ---
+
+backend_for() {
+  local f=$1 b
+  for b in gpg age sops; do
+    if "${b}_match" "$f"; then
+      "${b}_available" || die "$f needs the '$b' backend, but $b is not installed"
+      printf '%s' "$b"
+      return 0
+    fi
+  done
+  die "no backend recognizes $f (known: .gpg/.pgp/.asc, .age, sops-encrypted yaml/json/env/ini)"
+}
+
+# Encrypt scratch → ciphertext, atomically: write next to the target, then mv,
+# so an interrupted write can never truncate the real file.
+encrypt_back() {
+  local backend=$1 plain=$2 enc=$3 meta=$4 flags=$5
+  local tmp="$enc.zed-crypt-new"
+  if ( umask 077 && "${backend}_encrypt" "$plain" "$meta" "$flags" > "$tmp" ); then
+    mv "$tmp" "$enc"
+    return 0
+  fi
+  rm -f "$tmp"
+  printf '[%s] re-encrypt of %s FAILED; plaintext kept at %s\n' "$(date +%H:%M:%S)" "$enc" "$plain" >&2
+  command -v osascript >/dev/null && osascript -e \
+    "display notification \"re-encrypt FAILED for $(basename "$enc") — plaintext kept\" with title \"zed-crypt\"" 2>/dev/null
+  return 1
+}
+
+watch_loop() {
+  local backend=$1 plain=$2 enc=$3 meta=$4 flags=$5 last now
+  last=$(stat -f %m "$plain" 2>/dev/null || stat -c %Y "$plain" 2>/dev/null) || return
+  while sleep "$POLL_SECONDS"; do
+    [[ -f $plain ]] || return
+    now=$(stat -f %m "$plain" 2>/dev/null || stat -c %Y "$plain" 2>/dev/null) || return
+    if [[ $now != "$last" ]]; then
+      last=$now
+      encrypt_back "$backend" "$plain" "$enc" "$meta" "$flags" \
+        && printf '[%s] re-encrypted %s\n' "$(date +%H:%M:%S)" "$(basename "$enc")"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- commands ---
+
+cmd_edit() {
+  local enc=${1:-}
+  [[ -n $enc ]] || die "usage: zed-crypt edit FILE"
+  [[ -f $enc ]] || die "no such file: $enc"
+  enc=$(abs_path "$enc")
+
+  local backend
+  backend=$(backend_for "$enc") || exit 1
+
+  # sops already implements decrypt→$EDITOR→re-encrypt with its own tmpfile;
+  # bridging the blocking editor into it beats reimplementing that logic.
+  if [[ $backend == sops ]]; then
+    note "sops file; delegating to 'sops edit' (seals when the buffer closes)"
+    ( EDITOR="$EDITOR_CMD" sops edit "$enc" >/dev/null 2>&1 & )
+    return 0
+  fi
+
+  init_scratch
+  local plain meta flags pidf watchf srcf
+  plain=$(scratch_path_for "$enc")
+  meta="$plain.meta"; flags="$plain.flags"
+  pidf="$plain.session.pid"; watchf="$plain.watcher.pid"; srcf="$plain.src"
+
+  local -a editor_argv
+  read -ra editor_argv <<< "$EDITOR_CMD"
+
+  if [[ -f $pidf ]] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+    note "already open; reopening buffer"
+    ( "${editor_argv[@]}" "$plain" >/dev/null 2>&1 & )
+    return 0
+  fi
+
+  "${backend}_precheck" "$enc" "$meta" "$flags" || exit 1
+
+  # Restrictive permissions *before* any plaintext lands in the file.
+  ( umask 077 && : > "$plain" ) || die "cannot create scratch file"
+  if ! "${backend}_decrypt" "$enc" > "$plain"; then
+    rm -f "$plain" "$meta" "$flags"
+    die "decryption failed (wrong key, or passphrase entry was cancelled)"
+  fi
+  printf '%s\n' "$enc" > "$srcf"
+
+  # Session: watcher re-encrypts on every save; the blocking editor call keeps
+  # the session alive; when the buffer closes we seal and clean up.
+  (
+    exec </dev/null >>"$LOG" 2>&1
+    watch_loop "$backend" "$plain" "$enc" "$meta" "$flags" &
+    echo $! > "$watchf"
+    disown $!
+
+    "${editor_argv[@]}" "$plain"
+
+    kill "$(cat "$watchf" 2>/dev/null)" 2>/dev/null
+    if encrypt_back "$backend" "$plain" "$enc" "$meta" "$flags"; then
+      scrub "$plain"
+      printf '[%s] sealed %s\n' "$(date +%H:%M:%S)" "$enc"
+    else
+      printf '[%s] SEAL FAILED for %s; plaintext kept at %s\n' "$(date +%H:%M:%S)" "$enc" "$plain"
+    fi
+    rm -f "$meta" "$flags" "$watchf" "$pidf" "$srcf"
+    [[ -f $plain ]] || maybe_detach_ramdisk
+  ) &
+  echo $! > "$pidf"
+  disown
+
+  printf 'decrypted → %s\n' "$plain"
+  printf 'every save re-encrypts; closing the buffer seals automatically\n'
+}
+
+cmd_close() {
+  local enc=${1:-}
+  [[ -n $enc ]] || die "usage: zed-crypt close FILE"
+  enc=$(abs_path "$enc") || die "no such file"
+
+  init_scratch
+  local backend plain meta flags pidf watchf srcf
+  backend=$(backend_for "$enc") || exit 1
+  [[ $backend == sops ]] && die "sops sessions are owned by 'sops edit'; close the buffer instead"
+  plain=$(scratch_path_for "$enc")
+  meta="$plain.meta"; flags="$plain.flags"
+  pidf="$plain.session.pid"; watchf="$plain.watcher.pid"; srcf="$plain.src"
+
+  [[ -f $plain ]] || die "not open: $enc"
+
+  local f
+  for f in "$pidf" "$watchf"; do
+    [[ -f $f ]] && kill "$(cat "$f")" 2>/dev/null
+  done
+
+  encrypt_back "$backend" "$plain" "$enc" "$meta" "$flags" \
+    || die "final re-encrypt failed; plaintext left at $plain"
+  scrub "$plain"
+  rm -f "$meta" "$flags" "$pidf" "$watchf" "$srcf"
+  maybe_detach_ramdisk
+  printf 'sealed %s, plaintext removed\n' "$enc"
+}
+
+cmd_status() {
+  init_scratch
+  local found=0 pidf plain
+  for pidf in "$SCRATCH"/*.session.pid; do
+    [[ -e $pidf ]] || continue
+    plain=${pidf%.session.pid}
+    if kill -0 "$(cat "$pidf")" 2>/dev/null; then
+      printf '  open: %s  ←  %s\n' "$plain" "$(cat "$plain.src" 2>/dev/null || echo '?')"
+      found=1
+    fi
+  done
+  [[ $found -eq 1 ]] || printf '  (nothing open)\n'
+}
+
+cmd_backends() {
+  local b
+  for b in gpg age sops; do
+    if "${b}_available"; then printf '  %-5s available\n' "$b"; else printf '  %-5s not installed\n' "$b"; fi
+  done
+}
+
+case "${1:-}" in
+  edit)     shift; cmd_edit "$@" ;;
+  close)    shift; cmd_close "$@" ;;
+  status)   cmd_status ;;
+  backends) cmd_backends ;;
+  *) die "usage: zed-crypt {edit|close|status|backends} [FILE]" ;;
+esac
